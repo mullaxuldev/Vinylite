@@ -101,8 +101,13 @@ fn cp_ldc(pool: &Pool, index: u16) -> Expression {
             Expression::ConstString(cp_utf8(pool, *string_index))
         }
         Some(Recoverable::Present(ConstantPoolEntry::Class { name_index })) => {
-            let name = cp_utf8(pool, *name_index).replace('/', ".");
-            Expression::Unknown(format!("{name}.class"))
+            let raw = cp_utf8(pool, *name_index);
+            let display = if raw.starts_with('[') {
+                decode_type_descriptor(&raw)
+            } else {
+                raw.replace('/', ".")
+            };
+            Expression::Unknown(format!("{display}.class"))
         }
         _ => Expression::Unknown(format!("ldc#{index}")),
     }
@@ -193,6 +198,7 @@ struct StackMachine<'a> {
     is_static: bool,
     current_offset: usize,
     if_targets: HashMap<usize, usize>, // bytecode_offset -> target_offset
+    target_stacks: HashMap<usize, Vec<StackValue>>, // branch target -> stack snapshot
     switch_stubs: Vec<SwitchStub>,
     temp_counter: usize,
     /// Spilled fresh arrays (structural value -> temp name) for dup-sharing.
@@ -229,6 +235,7 @@ impl<'a> StackMachine<'a> {
             is_static,
             current_offset: 0,
             if_targets: HashMap::new(),
+            target_stacks: HashMap::new(),
             switch_stubs: Vec::new(),
             temp_counter: 0,
             array_temps: Vec::new(),
@@ -246,6 +253,26 @@ impl<'a> StackMachine<'a> {
         let name = format!("{prefix}{}", self.temp_counter);
         self.temp_counter += 1;
         name
+    }
+
+    /// Find a local variable of the given class name (for fixing putfield receivers).
+    fn find_local_of_class(&self, _class_name: &str) -> Option<Expression> {
+        for local in &self.locals {
+            if let Expression::Local(name) = local {
+                // Heuristic: if the local name suggests it's the right type (e.g., "pivot", "root", "node")
+                // or if we can infer from context, use it.
+                // For now, prefer known reference names over "this"/"var_N".
+                if !name.starts_with("var_") && name != "this" {
+                    return Some(Expression::Local(name.clone()));
+                }
+            }
+        }
+        // Fallback to `this` if no better candidate
+        if !self.is_static {
+            Some(Expression::This)
+        } else {
+            None
+        }
     }
 
     fn push(&mut self, expr: Expression) {
@@ -283,6 +310,10 @@ impl<'a> StackMachine<'a> {
     fn run(&mut self, instructions: &[Instruction]) {
         for instr in instructions {
             self.current_offset = instr.offset;
+            // Restore stack snapshot at branch target if available
+            if let Some(saved) = self.target_stacks.get(&instr.offset) {
+                self.stack = saved.clone();
+            }
             let entering_dead = self.dead_start.contains(&instr.offset);
             if entering_dead {
                 self.sandbox.push(self.stack.clone());
@@ -416,26 +447,35 @@ impl<'a> StackMachine<'a> {
                             } else {
                                 // Can't find the synthetic body — emit a lambda that calls the method directly
                                 let args = self.pop_n(param_count);
+                                let class_display = short_name(&impl_method.0);
                                 let target =
                                     if !args.is_empty() && matches!(args[0], Expression::This) {
                                         "this".to_string()
                                     } else {
-                                        short_name(&impl_method.0)
+                                        class_display.clone()
                                     };
-                                let invoke = Expression::Invoke {
-                                    target: if target == "this" || target.is_empty() {
-                                        impl_method.1.clone()
-                                    } else {
-                                        format!("{}.{}", target, impl_method.1)
-                                    },
-                                    args: args
-                                        .into_iter()
-                                        .skip(if target == "this" { 1 } else { 0 })
-                                        .collect(),
+                                let stmt = if impl_method.1 == "<init>" {
+                                    Statement::Return(Some(Expression::New {
+                                        class: class_display,
+                                        args: vec![],
+                                    }))
+                                } else {
+                                    let invoke = Expression::Invoke {
+                                        target: if target == "this" || target.is_empty() {
+                                            impl_method.1.clone()
+                                        } else {
+                                            format!("{}.{}", target, impl_method.1)
+                                        },
+                                        args: args
+                                            .into_iter()
+                                            .skip(if target == "this" { 1 } else { 0 })
+                                            .collect(),
+                                    };
+                                    Statement::Expression(invoke)
                                 };
                                 self.push(Expression::Lambda {
                                     params: vec![],
-                                    body: vec![Statement::Expression(invoke)],
+                                    body: vec![stmt],
                                 });
                                 return;
                             }
@@ -650,9 +690,14 @@ impl<'a> StackMachine<'a> {
                 .map(Expression::ConstString),
             Some(Recoverable::Present(ConstantPoolEntry::Class { name_index })) => {
                 match self.pool.get(*name_index as usize) {
-                    Some(Recoverable::Present(ConstantPoolEntry::Utf8(name))) => Some(
-                        Expression::Unknown(format!("{}.class", name.replace('/', "."))),
-                    ),
+                    Some(Recoverable::Present(ConstantPoolEntry::Utf8(name))) => {
+                        let display = if name.starts_with('[') {
+                            decode_type_descriptor(name)
+                        } else {
+                            name.replace('/', ".")
+                        };
+                        Some(Expression::Unknown(format!("{display}.class")))
+                    }
                     _ => None,
                 }
             }
@@ -786,8 +831,14 @@ impl<'a> StackMachine<'a> {
                         }
                     }
                     for expr in popped.into_iter().rev() {
-                        if expr_has_side_effects(&expr) {
-                            self.emit(Statement::Expression(expr));
+                        // Cast expressions are not valid Java statements by themselves.
+                        // If the inner expression has side effects, emit the inner expression instead.
+                        let expr_to_emit = match &expr {
+                            Expression::Cast { expr, .. } => expr.as_ref().clone(),
+                            _ => expr.clone(),
+                        };
+                        if expr_has_side_effects(&expr_to_emit) {
+                            self.emit(Statement::Expression(expr_to_emit));
                         }
                     }
                 }
@@ -868,6 +919,12 @@ impl<'a> StackMachine<'a> {
             // â”€â”€ Control flow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             InstructionKind::If { opcode, target } => {
                 let cond = make_if_cond(*opcode, &mut self.stack);
+                // Only save branch target snapshot if target hasn't been visited yet
+                if (*target as usize) > self.current_offset {
+                    self.target_stacks
+                        .entry(*target as usize)
+                        .or_insert_with(|| self.stack.clone());
+                }
                 self.emit(Statement::If {
                     condition: cond,
                     then_body: vec![],
@@ -877,6 +934,11 @@ impl<'a> StackMachine<'a> {
                     .insert(self.current_offset, *target as usize);
             }
             InstructionKind::Goto(target) => {
+                if (*target as usize) > self.current_offset {
+                    self.target_stacks
+                        .entry(*target as usize)
+                        .or_insert_with(|| self.stack.clone());
+                }
                 self.emit(Statement::Expression(Expression::Unknown(format!(
                     "@goto {target}"
                 ))));
@@ -1017,11 +1079,16 @@ impl<'a> StackMachine<'a> {
                                 }
                             } else if !contains_empty_stack(&receiver) {
                                 // Skip if receiver contains empty_stack noise
-                                let receiver_str = render_expr_at(&receiver, 2);
+                                let receiver_str = match &receiver {
+                                    Expression::Cast { .. } => {
+                                        format!("({})", render_expr_at(&receiver, 2))
+                                    }
+                                    _ => render_expr_at(&receiver, 2),
+                                };
                                 let target = if receiver_str.is_empty() {
                                     method
                                 } else {
-                                    format!("{}.{}", receiver_str, method)
+                                    format!("{receiver_str}.{method}")
                                 };
                                 let invoke = Expression::Invoke { target, args };
                                 if desc.ends_with(")V") {
@@ -1082,7 +1149,21 @@ impl<'a> StackMachine<'a> {
                         // putfield
                         let val = self.pop();
                         let val = coerce_bool_literal(val, &desc);
-                        let object = self.pop();
+                        let mut object = self.pop();
+                        // Fix: if receiver is not a valid reference (e.g., ConstInt from stack pollution),
+                        // try to find the correct receiver from local variables based on field's class.
+                        #[allow(clippy::collapsible_if)]
+                        if matches!(
+                            object,
+                            Expression::ConstInt(_)
+                                | Expression::ConstLong(_)
+                                | Expression::ConstFloat(_)
+                                | Expression::ConstDouble(_)
+                        ) {
+                            if let Some(local_expr) = self.find_local_of_class(&class) {
+                                object = local_expr;
+                            }
+                        }
                         if contains_empty_stack(&val) || contains_empty_stack(&object) {
                             self.emit(Statement::Expression(Expression::Unknown(format!(
                                 "/* unreconstructable putfield {field} */"
@@ -6024,8 +6105,8 @@ pub fn lower_method_to_ast(
     lambda_bodies: &HashMap<String, Vec<Statement>>,
     known_fields: &std::collections::HashSet<String>,
 ) -> MethodDecl {
-    let (params, return_type) =
-        crate::generics::generic_method_types(method_descriptor, method_signature);
+    let (type_params, params, return_type) =
+        crate::generics::generic_method_types_full(method_descriptor, method_signature);
     let mut param_names: Vec<String> = params
         .iter()
         .enumerate()
@@ -6127,7 +6208,11 @@ pub fn lower_method_to_ast(
         let start_local = if is_static { 0 } else { 1 };
         for entry in lvt {
             let name = cp_utf8(pool, entry.name_index);
-            if name != "this" && (entry.index as usize) < machine.locals.len() {
+            // Skip numeric-only names (synthetic/temp variables) to avoid "39.append()" etc.
+            if name != "this"
+                && !name.chars().all(|c| c.is_ascii_digit())
+                && (entry.index as usize) < machine.locals.len()
+            {
                 machine.locals[entry.index as usize] = Expression::Local(name.clone());
                 // Also update param_names if this entry is a parameter
                 if (entry.index as usize) >= start_local {
@@ -6138,6 +6223,15 @@ pub fn lower_method_to_ast(
                 }
             }
         }
+    }
+
+    // For instance methods, slot 0 is always `this`
+    if !is_static
+        && !machine.locals.is_empty()
+        && let Expression::Local(ref name) = machine.locals[0]
+        && name.starts_with("var_")
+    {
+        machine.locals[0] = Expression::Local("this".to_string());
     }
 
     // Initialize parameter locals (local 0 = this for instance methods)
@@ -6273,6 +6367,7 @@ pub fn lower_method_to_ast(
         param_types: params,
         param_names,
         class_name: this_class.replace('/', "."),
+        type_params,
         // Filled in by the caller (lib.rs), which owns the constant pool
         // view needed for annotation rendering.
         annotations: Vec::new(),

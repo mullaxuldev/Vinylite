@@ -354,11 +354,22 @@ pub fn format_method_sig(sig: &MethodSignature) -> (String, Vec<String>, String)
             .iter()
             .map(|tp| {
                 let mut s = tp.name.clone();
+                let mut has_bound = false;
                 if let Some(ref bound) = tp.bound {
-                    s.push_str(&format!(" extends {}", format_generic(bound)));
+                    let bound_str = format_generic(bound);
+                    if bound_str != "java.lang.Object" {
+                        s.push_str(&format!(" extends {}", bound_str));
+                        has_bound = true;
+                    }
                 }
                 for ib in &tp.interface_bounds {
-                    s.push_str(&format!(" & {}", format_generic(ib)));
+                    let ib_str = format_generic(ib);
+                    if !has_bound {
+                        s.push_str(&format!(" extends {}", ib_str));
+                        has_bound = true;
+                    } else {
+                        s.push_str(&format!(" & {}", ib_str));
+                    }
                 }
                 s
             })
@@ -382,11 +393,23 @@ pub fn format_class_sig(sig: &ClassSignature) -> (String, String, Vec<String>) {
             .iter()
             .map(|tp| {
                 let mut s = tp.name.clone();
+                let mut has_bound = false;
                 if let Some(ref bound) = tp.bound {
-                    s.push_str(&format!(" extends {}", format_generic(bound)));
+                    // Omit redundant `extends java.lang.Object` bound UNLESS there are interface bounds
+                    let bound_str = format_generic(bound);
+                    if bound_str != "java.lang.Object" {
+                        s.push_str(&format!(" extends {}", bound_str));
+                        has_bound = true;
+                    }
                 }
                 for ib in &tp.interface_bounds {
-                    s.push_str(&format!(" & {}", format_generic(ib)));
+                    let ib_str = format_generic(ib);
+                    if !has_bound {
+                        s.push_str(&format!(" extends {}", ib_str));
+                        has_bound = true;
+                    } else {
+                        s.push_str(&format!(" & {}", ib_str));
+                    }
                 }
                 s
             })
@@ -400,22 +423,32 @@ pub fn format_class_sig(sig: &ClassSignature) -> (String, String, Vec<String>) {
     (type_params, super_class, interfaces)
 }
 
+/// Resolve method parameter/return types and type parameters, preferring the generic `Signature`
+/// when present.
+pub fn generic_method_types_full(
+    descriptor: &str,
+    signature: Option<&str>,
+) -> (String, Vec<String>, String) {
+    if let Some(sig) = signature
+        && let Some(parsed) = parse_method_signature(sig)
+    {
+        let (tp, params, ret) = format_method_sig(&parsed);
+        let (erased_params, erased_ret) = crate::descriptor::parse_descriptor(descriptor);
+        if params.len() == erased_params.len() {
+            return (tp, params, ret);
+        }
+        return (String::new(), erased_params, erased_ret);
+    }
+    let (erased_params, erased_ret) = crate::descriptor::parse_descriptor(descriptor);
+    (String::new(), erased_params, erased_ret)
+}
+
 /// Resolve method parameter/return types, preferring the generic `Signature`
 /// when present (CFR/Vineflower show `List<String>`, not raw `List`).
 /// Falls back to the erased descriptor on any parse failure.
 pub fn generic_method_types(descriptor: &str, signature: Option<&str>) -> (Vec<String>, String) {
-    if let Some(sig) = signature
-        && let Some(parsed) = parse_method_signature(sig)
-    {
-        let (_, params, ret) = format_method_sig(&parsed);
-        // Guard against arity mismatch (malformed Signature attribute).
-        let (erased_params, erased_ret) = crate::descriptor::parse_descriptor(descriptor);
-        if params.len() == erased_params.len() {
-            return (params, ret);
-        }
-        return (erased_params, erased_ret);
-    }
-    crate::descriptor::parse_descriptor(descriptor)
+    let (_, params, ret) = generic_method_types_full(descriptor, signature);
+    (params, ret)
 }
 
 /// Resolve a field type, preferring the generic `Signature` when present.

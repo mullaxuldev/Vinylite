@@ -192,6 +192,7 @@ pub struct MethodDecl {
     pub param_types: Vec<String>,
     pub param_names: Vec<String>,
     pub class_name: String,
+    pub type_params: String,
     /// Short-rendered annotations, e.g. `Override`, `Deprecated`.
     pub annotations: Vec<String>,
 }
@@ -205,7 +206,11 @@ pub struct ClassDecl {
     pub methods: Vec<MethodDecl>,
     pub access_flags: u16,
     pub super_name: Option<String>,
+    pub interfaces: Vec<String>,
+    pub type_params: String,
     pub is_enum: bool,
+    pub is_interface: bool,
+    pub is_annotation: bool,
     pub enum_constants: Vec<String>,
     /// Short-rendered annotations, e.g. `Deprecated`, `FunctionalInterface`.
     pub annotations: Vec<String>,
@@ -237,7 +242,10 @@ impl ClassDecl {
 
         // Class header
         if self.is_enum {
-            body.push_str("public enum ");
+            if self.access_flags & 0x0001 != 0 {
+                body.push_str("public ");
+            }
+            body.push_str("enum ");
             body.push_str(&self.name);
             body.push_str(" {\n");
             for (i, constant) in self.enum_constants.iter().enumerate() {
@@ -250,15 +258,43 @@ impl ClassDecl {
                 }
             }
         } else {
-            body.push_str("public class ");
-            body.push_str(&self.name);
+            let mut header = String::new();
+            if self.access_flags & 0x0001 != 0 {
+                header.push_str("public ");
+            }
+            if self.access_flags & 0x0400 != 0 && !self.is_interface && !self.is_annotation {
+                header.push_str("abstract ");
+            }
+            if self.access_flags & 0x0010 != 0 {
+                header.push_str("final ");
+            }
+            if self.is_annotation {
+                header.push_str("@interface ");
+            } else if self.is_interface {
+                header.push_str("interface ");
+            } else {
+                header.push_str("class ");
+            }
+            header.push_str(&self.name);
+            if !self.type_params.is_empty() {
+                header.push_str(&self.type_params);
+            }
             if let Some(super_name) = &self.super_name
                 && super_name.split('<').next().unwrap_or(super_name) != "java.lang.Object"
             {
-                body.push_str(" extends ");
-                body.push_str(&short_type(super_name));
+                header.push_str(" extends ");
+                header.push_str(&short_type(super_name));
             }
-            body.push_str(" {\n");
+            if !self.interfaces.is_empty() {
+                header.push_str(if self.is_interface {
+                    " extends "
+                } else {
+                    " implements "
+                });
+                header.push_str(&self.interfaces.join(", "));
+            }
+            header.push_str(" {\n");
+            body.push_str(&header);
         }
 
         // Render fields
@@ -267,7 +303,8 @@ impl ClassDecl {
             if self.is_enum
                 && (field.name.starts_with('$')
                     || field.name == "ENUM$VALUES"
-                    || field.name == "INSTANCE")
+                    || field.name == "INSTANCE"
+                    || self.enum_constants.contains(&field.name))
             {
                 continue;
             }
@@ -356,7 +393,7 @@ fn render_method(method: &MethodDecl) -> String {
     let is_clinit = method.name == "<clinit>";
     let is_init = method.name == "<init>";
 
-    if !is_clinit && !is_init {
+    if !is_clinit {
         if method.access_flags & 0x0001 != 0 {
             out.push_str("public ");
         } else if method.access_flags & 0x0002 != 0 {
@@ -404,7 +441,11 @@ fn render_method(method: &MethodDecl) -> String {
     } else if is_clinit {
         out.push_str("static {\n");
     } else {
-        // Return type and name
+        // Return type and name (with generic method type parameters if present)
+        if !method.type_params.is_empty() {
+            out.push_str(&method.type_params);
+            out.push(' ');
+        }
         out.push_str(&short_type(&method.return_type));
         out.push(' ');
         out.push_str(&method.name);
@@ -542,8 +583,14 @@ fn render_statement(stmt: &Statement, indent: usize) -> String {
             out.push_str(";\n");
         }
         Statement::Expression(expr) => {
+            // A bare cast expression `(T) expr;` is not a valid Java statement.
+            // Unwrap down to the underlying expression (typically an invoke).
+            let mut inner = expr;
+            while let Expression::Cast { expr: sub, .. } = inner {
+                inner = sub;
+            }
             out.push_str(&pad);
-            out.push_str(&render_expression_at(expr, indent));
+            out.push_str(&render_expression_at(inner, indent));
             out.push_str(";\n");
         }
         Statement::If {
@@ -771,7 +818,39 @@ fn render_statement(stmt: &Statement, indent: usize) -> String {
 /// Generic-aware: each qualified segment inside `<...>`, after `&`/`, `/`?` etc.
 /// is shortened too, so `java.util.List<java.lang.String>` → `List<String>`
 /// (CFR/Vineflower print generics with short names + imports).
+/// Also decodes raw JVM array descriptors (e.g. `[Field;` → `Field[]`).
 fn short_type(ty: &str) -> String {
+    let trimmed = ty.trim();
+    if trimmed.starts_with('[') {
+        let mut dims = 0;
+        let mut rest = trimmed;
+        while let Some(sub) = rest.strip_prefix('[') {
+            dims += 1;
+            rest = sub;
+        }
+        let base = match rest {
+            "Z" => "boolean",
+            "B" => "byte",
+            "C" => "char",
+            "S" => "short",
+            "I" => "int",
+            "J" => "long",
+            "F" => "float",
+            "D" => "double",
+            _ if rest.starts_with('L') && rest.ends_with(';') => {
+                let inner = &rest[1..rest.len() - 1];
+                let dotted = inner.replace('/', ".");
+                return format!("{}{}", short_type(&dotted), "[]".repeat(dims));
+            }
+            _ => {
+                let stripped = rest.strip_suffix(';').unwrap_or(rest);
+                let dotted = stripped.replace('/', ".");
+                return format!("{}{}", short_type(&dotted), "[]".repeat(dims));
+            }
+        };
+        return format!("{base}{}", "[]".repeat(dims));
+    }
+
     let mut out = String::with_capacity(ty.len());
     let mut run_start: Option<usize> = None;
 
@@ -1085,7 +1164,11 @@ mod tests {
             methods: vec![],
             access_flags: 0x0001,
             super_name: None,
+            interfaces: vec![],
+            type_params: String::new(),
             is_enum: false,
+            is_interface: false,
+            is_annotation: false,
             enum_constants: vec![],
             annotations: vec![],
         };
@@ -1107,6 +1190,7 @@ mod tests {
             param_types: vec![],
             param_names: vec![],
             class_name: "Example".to_string(),
+            type_params: String::new(),
             annotations: vec![],
         }
     }
@@ -1120,7 +1204,11 @@ mod tests {
             methods: vec![method],
             access_flags: 0x0001,
             super_name: None,
+            interfaces: vec![],
+            type_params: String::new(),
             is_enum: false,
+            is_interface: false,
+            is_annotation: false,
             enum_constants: vec![],
             annotations: vec![],
         }
@@ -1202,11 +1290,16 @@ mod tests {
                 param_types: vec![],
                 param_names: vec![],
                 class_name: "Example".to_string(),
+                type_params: String::new(),
                 annotations: vec![],
             }],
             access_flags: 0x0001,
             super_name: Some("java.lang.Object".to_string()),
+            interfaces: vec![],
+            type_params: String::new(),
             is_enum: false,
+            is_interface: false,
+            is_annotation: false,
             enum_constants: vec![],
             annotations: vec![],
         };
@@ -1236,7 +1329,11 @@ mod tests {
             methods: vec![],
             access_flags: 0x0001,
             super_name: Some("java.lang.Enum<com.example.Repo>".to_string()),
+            interfaces: vec![],
+            type_params: String::new(),
             is_enum: false,
+            is_interface: false,
+            is_annotation: false,
             enum_constants: vec![],
             annotations: vec![],
         };
@@ -1284,11 +1381,16 @@ mod tests {
                 param_types: vec![],
                 param_names: vec![],
                 class_name: "S".to_string(),
+                type_params: String::new(),
                 annotations: vec![],
             }],
             access_flags: 0x0001,
             super_name: None,
+            interfaces: vec![],
+            type_params: String::new(),
             is_enum: false,
+            is_interface: false,
+            is_annotation: false,
             enum_constants: vec![],
             annotations: vec![],
         };
