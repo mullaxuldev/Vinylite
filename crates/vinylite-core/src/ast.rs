@@ -364,7 +364,11 @@ impl ClassDecl {
             sorted.dedup();
             for imp in &sorted {
                 let short = imp.rsplit('.').next().unwrap_or(imp);
-                if body.contains(short) {
+                // Check if short name appears as a discrete identifier/token in the body
+                let is_used = body
+                    .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+                    .any(|tok| tok == short);
+                if is_used {
                     out.push_str("import ");
                     out.push_str(imp);
                     out.push_str(";\n");

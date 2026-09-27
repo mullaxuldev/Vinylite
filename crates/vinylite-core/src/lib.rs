@@ -123,6 +123,20 @@ fn rendered_method_annotations(
 /// `equals/hashCode/toString/clone/finalize` with exact descriptors.
 /// No hierarchy needed — any instance method with these signatures (outside
 /// `java.lang.Object` itself) overrides Object.
+fn is_java_lang_implicit(dot_name: &str) -> bool {
+    if let Some(rest) = dot_name.strip_prefix("java.lang.") {
+        // Only top-level java.lang classes are implicit (Object, String, etc.)
+        // Subpackages like java.lang.reflect.*, java.lang.annotation.* are NOT implicit!
+        !rest.contains('.')
+    } else {
+        false
+    }
+}
+
+/// True for instance methods that provably override `java.lang.Object`:
+/// `equals/hashCode/toString/clone/finalize` with exact descriptors.
+/// No hierarchy needed — any instance method with these signatures (outside
+/// `java.lang.Object` itself) overrides Object.
 fn is_object_override(
     method_name: &str,
     descriptor: &str,
@@ -201,9 +215,6 @@ pub fn build_class_decl_with_classpath(
 
     let is_interface = class.access_flags & 0x0200 != 0;
     let is_annotation = is_interface && class.access_flags & 0x2000 != 0;
-
-    // Collect referenced classes for imports
-    let imports = collect_imports(class, &class_name);
 
     // Collect known field names
     let known_fields: std::collections::HashSet<String> = class
@@ -431,6 +442,9 @@ pub fn build_class_decl_with_classpath(
         })
         .collect();
 
+    // Re-collect referenced classes for imports now that fields/methods/classes are fully populated
+    let imports = collect_imports(class, &class_name);
+
     ClassDecl {
         name: simple_name,
         package,
@@ -508,22 +522,49 @@ fn collect_imports(class: &ClassFile, this_class: &str) -> Vec<String> {
 
     let mut imports = Vec::new();
 
+    let add_type = |raw: &str, imports: &mut Vec<String>| {
+        let mut s = raw;
+        while let Some(stripped) = s.strip_prefix('[') {
+            s = stripped;
+        }
+        let inner = if let Some(stripped) = s.strip_prefix('L') {
+            stripped.strip_suffix(';').unwrap_or(stripped)
+        } else {
+            s
+        };
+        let dot = inner.replace('/', ".");
+        if dot != this_dot
+            && !is_java_lang_implicit(&dot)
+            && Some(dot.as_str()) != this_pkg
+            && dot.contains('.')
+        {
+            imports.push(dot);
+        }
+    };
+
+    let scan_desc = |desc: &str, imports: &mut Vec<String>| {
+        let mut s = desc;
+        while let Some(idx) = s.find('L') {
+            s = &s[idx + 1..];
+            let end = s.find([';', '<']).unwrap_or(s.len());
+            let obj_type = s[..end].trim_start_matches(':');
+            s = &s[end..];
+            let dot = obj_type.replace('/', ".");
+            if dot != this_dot
+                && !is_java_lang_implicit(&dot)
+                && Some(dot.as_str()) != this_pkg
+                && dot.contains('.')
+            {
+                imports.push(dot);
+            }
+        }
+    };
+
     for entry in &class.constant_pool {
         match entry {
             Recoverable::Present(ConstantPoolEntry::Class { name_index }) => {
                 if let Some(raw_name) = get_utf8_from_pool(&class.constant_pool, *name_index) {
-                    let name = raw_name
-                        .trim_start_matches('[')
-                        .trim_start_matches('L')
-                        .trim_end_matches(';');
-                    let dot = name.replace('/', ".");
-                    if dot != this_dot
-                        && !dot.starts_with("java.lang.")
-                        && Some(dot.as_str()) != this_pkg
-                        && dot.contains('.')
-                    {
-                        imports.push(dot);
-                    }
+                    add_type(&raw_name, &mut imports);
                 }
             }
             Recoverable::Present(ConstantPoolEntry::MethodRef {
@@ -538,67 +579,23 @@ fn collect_imports(class: &ClassFile, this_class: &str) -> Vec<String> {
                 class_index,
                 name_and_type_index,
             }) => {
-                if let Some(name) = get_class_name_from_pool(&class.constant_pool, *class_index)
-                    && !name.starts_with('[')
-                {
-                    let dot = name.replace('/', ".");
-                    if dot != this_dot
-                        && !dot.starts_with("java.lang.")
-                        && Some(dot.as_str()) != this_pkg
-                        && dot.contains('.')
-                    {
-                        imports.push(dot);
-                    }
+                if let Some(name) = get_class_name_from_pool(&class.constant_pool, *class_index) {
+                    add_type(&name, &mut imports);
                 }
-                // Scan descriptor for return and parameter object types
                 if let Some(Recoverable::Present(ConstantPoolEntry::NameAndType {
                     descriptor_index,
                     ..
                 })) = class.constant_pool.get(*name_and_type_index as usize)
                     && let Some(desc) = get_utf8_from_pool(&class.constant_pool, *descriptor_index)
                 {
-                    let mut s = desc.as_str();
-                    while let Some(idx) = s.find('L') {
-                        s = &s[idx + 1..];
-                        if let Some(end) = s.find(';') {
-                            let obj_type = &s[..end];
-                            s = &s[end + 1..];
-                            let dot = obj_type.replace('/', ".");
-                            if dot != this_dot
-                                && !dot.starts_with("java.lang.")
-                                && Some(dot.as_str()) != this_pkg
-                                && dot.contains('.')
-                            {
-                                imports.push(dot);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
+                    scan_desc(&desc, &mut imports);
                 }
             }
             Recoverable::Present(ConstantPoolEntry::NameAndType {
                 descriptor_index, ..
             }) => {
                 if let Some(desc) = get_utf8_from_pool(&class.constant_pool, *descriptor_index) {
-                    let mut s = desc.as_str();
-                    while let Some(idx) = s.find('L') {
-                        s = &s[idx + 1..];
-                        if let Some(end) = s.find(';') {
-                            let obj_type = &s[..end];
-                            s = &s[end + 1..];
-                            let dot = obj_type.replace('/', ".");
-                            if dot != this_dot
-                                && !dot.starts_with("java.lang.")
-                                && Some(dot.as_str()) != this_pkg
-                                && dot.contains('.')
-                            {
-                                imports.push(dot);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
+                    scan_desc(&desc, &mut imports);
                 }
             }
             _ => {}
@@ -608,80 +605,22 @@ fn collect_imports(class: &ClassFile, this_class: &str) -> Vec<String> {
     // Also scan member descriptors (fields and methods) and signatures for imports
     for f in &class.fields {
         if let Some(desc) = get_utf8_from_pool(&class.constant_pool, f.descriptor_index) {
-            let mut s = desc.as_str();
-            while let Some(idx) = s.find('L') {
-                s = &s[idx + 1..];
-                if let Some(end) = s.find(';') {
-                    let obj_type = &s[..end];
-                    s = &s[end + 1..];
-                    let dot = obj_type.replace('/', ".");
-                    if dot != this_dot
-                        && !dot.starts_with("java.lang.")
-                        && Some(dot.as_str()) != this_pkg
-                        && dot.contains('.')
-                    {
-                        imports.push(dot);
-                    }
-                } else {
-                    break;
-                }
-            }
+            add_type(&desc, &mut imports);
+            scan_desc(&desc, &mut imports);
         }
         if let Some(ref sig) = f.signature {
-            let mut s = sig.as_str();
-            while let Some(idx) = s.find('L') {
-                s = &s[idx + 1..];
-                let end = s.find([';', '<']).unwrap_or(s.len());
-                let obj_type = s[..end].trim_start_matches(':');
-                s = &s[end..];
-                let dot = obj_type.replace('/', ".");
-                if dot != this_dot
-                    && !dot.starts_with("java.lang.")
-                    && Some(dot.as_str()) != this_pkg
-                    && dot.contains('.')
-                {
-                    imports.push(dot);
-                }
-            }
+            add_type(sig, &mut imports);
+            scan_desc(sig, &mut imports);
         }
     }
     for m in &class.methods {
         if let Some(desc) = get_utf8_from_pool(&class.constant_pool, m.descriptor_index) {
-            let mut s = desc.as_str();
-            while let Some(idx) = s.find('L') {
-                s = &s[idx + 1..];
-                if let Some(end) = s.find(';') {
-                    let obj_type = &s[..end];
-                    s = &s[end + 1..];
-                    let dot = obj_type.replace('/', ".");
-                    if dot != this_dot
-                        && !dot.starts_with("java.lang.")
-                        && Some(dot.as_str()) != this_pkg
-                        && dot.contains('.')
-                    {
-                        imports.push(dot);
-                    }
-                } else {
-                    break;
-                }
-            }
+            add_type(&desc, &mut imports);
+            scan_desc(&desc, &mut imports);
         }
         if let Some(ref sig) = m.signature {
-            let mut s = sig.as_str();
-            while let Some(idx) = s.find('L') {
-                s = &s[idx + 1..];
-                let end = s.find([';', '<']).unwrap_or(s.len());
-                let obj_type = s[..end].trim_start_matches(':');
-                s = &s[end..];
-                let dot = obj_type.replace('/', ".");
-                if dot != this_dot
-                    && !dot.starts_with("java.lang.")
-                    && Some(dot.as_str()) != this_pkg
-                    && dot.contains('.')
-                {
-                    imports.push(dot);
-                }
-            }
+            add_type(sig, &mut imports);
+            scan_desc(sig, &mut imports);
         }
     }
 
@@ -700,7 +639,7 @@ fn collect_imports(class: &ClassFile, this_class: &str) -> Vec<String> {
     for dotted in annotation_types {
         let outer = dotted.split('$').next().unwrap_or(&dotted).to_string();
         if outer != this_dot
-            && !outer.starts_with("java.lang.")
+            && !is_java_lang_implicit(&outer)
             && Some(outer.as_str()) != this_pkg
             && outer.contains('.')
         {
